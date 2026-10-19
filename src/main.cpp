@@ -30,7 +30,7 @@
 // Set to 1 to run the matrix bring-up test pattern instead of the eyes.
 // Use this to verify dimensions, wiring order, and orientation on a new
 // panel, then set back to 0 for the eyes. See runTestPattern() below.
-#define TEST_PATTERN   1
+#define TEST_PATTERN   0
 
 // Data pin feeding the matrix.
 #define LED_PIN        D7
@@ -45,13 +45,34 @@
 #define FLIP_VERTICAL  false
 
 // Global brightness 0–255. Keep modest unless you have a beefy 5V supply.
-#define BRIGHTNESS     40
+#define BRIGHTNESS     30
 
 // Caine's eyes: left iris green, right iris blue.
 #define LEFT_EYE_COLOR   CRGB(0,   255, 60)    // left eye (green)
 #define RIGHT_EYE_COLOR  CRGB(0,   80,  255)   // right eye (blue)
-#define PUPIL_COLOR      CRGB(0,   0,   0)     // pupil (off)
+// Pupil color. For a dark pupil (Caine), use CRGB::Black — the pixels
+// under the pupil are fully carved out so it reads as a true hole even
+// against the glow. For a bright highlight pupil, use e.g. white.
+#define PUPIL_COLOR      CRGB::Black           // pupil (dark, Caine-style)
 #define BG_COLOR         CRGB(0,   0,   0)     // background
+
+// Pupil radius in pixels (at normal eye size). Kept small so a ring of
+// iris color always frames it.
+#define PUPIL_RADIUS     0.8f
+
+// Color bleed / fade: width in pixels of the OUTWARD glow halo only. The
+// eye interior stays solid/crisp; this only softens the outside edge and
+// spills color into surrounding pixels. 0 = hard outer edge (no bleed);
+// larger = softer, dreamier. ~1.5-2.5 looks good on 8px.
+#define BLEED_WIDTH      1.6f
+
+// Pupil edge: 1 = antialiased (soft) pupil edge, 0 = hard crisp edge.
+#define PUPIL_SOFT_EDGE  0
+
+// Floatiness: how much the eyes continuously roll/wander around their
+// orbits. 0 = still (only discrete darts); 1 = lively constant roaming.
+// Controls both the orbit radius and the drift speed.
+#define FLOATINESS       0.8f
 
 // Eye size scaling. The eye radius is multiplied by a scale that the
 // animation drives between SCALE_MIN and SCALE_MAX.
@@ -62,7 +83,7 @@
 // even when resting. BREATH_AMP is added to/subtracted from the scale;
 // BREATH_PERIOD_MS is one full inhale+exhale cycle.
 #define BREATH_AMP        0.12f
-#define BREATH_PERIOD_MS  3200.0f
+#define BREATH_PERIOD_MS  1600.0f
 
 // ======================================================
 
@@ -191,9 +212,13 @@ struct Eye {
   float baseRy;   // base vertical radius (before scale)
 };
 
-// Shared pupil look direction.
+// Shared pupil look direction (discrete gaze from the state machine).
 float pupilX = 0.0f, pupilY = 0.0f;
 float pupilTargetX = 0.0f, pupilTargetY = 0.0f;
+
+// Continuous floaty drift added on top of the gaze, so the eyes roll
+// around their orbits almost constantly. Updated each frame.
+float driftX = 0.0f, driftY = 0.0f;
 
 // Eyelid openness, 1.0 = open, 0.0 = closed. Per eye so we can wink.
 float lidLeft = 1.0f, lidRight = 1.0f;
@@ -213,18 +238,14 @@ void setupEyes() {
   rightEye = { MATRIX_WIDTH - 1 - quarter, cy, rx, ry };
 }
 
-// Width (in pixels) of the soft edge + outward glow. Larger = softer and
-// more color bleed into the surrounding pixels.
-#define GLOW_WIDTH   1.6f
-
 // Draw one eye as a soft-edged ellipse that bleeds its color into the
-// surrounding pixels, clipped by the eyelid, with a soft pupil.
+// surrounding pixels, clipped by the eyelid, with a bright pupil.
 //
 // Coverage model: for each pixel we compute an ellipse "radius" value
 //   r = sqrt((dx/rx)^2 + (dy/ry)^2)
 // r < 1 is solidly inside the eye. Between 1 and (1 + feather) the
 // coverage ramps from full down to zero, producing an antialiased edge
-// and an outward glow halo that softens the pixelation.
+// and an outward glow halo (BLEED_WIDTH) that softens the pixelation.
 void drawEye(const Eye& eye, float lid, float scale, const CRGB& color) {
   float rx = eye.baseRx * scale;
   float ry = eye.baseRy * scale;
@@ -235,13 +256,15 @@ void drawEye(const Eye& eye, float lid, float scale, const CRGB& color) {
   if (openRy < 0.25f) return;  // effectively shut
 
   // Feather amount expressed in normalized-radius units for each axis,
-  // derived from the glow width in pixels.
-  float featherX = GLOW_WIDTH / rx;
-  float featherY = GLOW_WIDTH / ry;
+  // derived from the bleed width in pixels. A larger BLEED_WIDTH softens
+  // the edge and spills more color into neighboring pixels.
+  float featherX = BLEED_WIDTH / rx;
+  float featherY = BLEED_WIDTH / ry;
   float feather  = (featherX + featherY) * 0.5f;
+  if (feather < 0.0001f) feather = 0.0001f;  // avoid divide-by-zero
 
-  int spanX = (int)ceilf(rx + GLOW_WIDTH);
-  int spanY = (int)ceilf(ry + GLOW_WIDTH);
+  int spanX = (int)ceilf(rx + BLEED_WIDTH);
+  int spanY = (int)ceilf(ry + BLEED_WIDTH);
 
   for (int dy = -spanY; dy <= spanY; dy++) {
     for (int dx = -spanX; dx <= spanX; dx++) {
@@ -257,46 +280,67 @@ void drawEye(const Eye& eye, float lid, float scale, const CRGB& color) {
 
       if (cov <= 0.0f) continue;
 
-      // Soft eyelid clip: fade out vertically near the lid boundary
-      // instead of a hard cut.
+      // Eyelid clip: hard vertical cut so the eye interior stays solid
+      // (the bleed is an OUTWARD glow only, not an inward fade). During a
+      // blink the whole eye shrinks vertically via openRy.
       float ay = fabs((float)dy);
-      float lidCov;
-      if (ay <= openRy)            lidCov = 1.0f;
-      else if (ay >= openRy + 1.0f) lidCov = 0.0f;
-      else                          lidCov = 1.0f - (ay - openRy);
+      if (ay > openRy) continue;
 
-      float amount = cov * lidCov;
-      if (amount > 0.0f) {
-        addPixel(eye.cx + dx, eye.cy + dy, color, amount);
+      if (cov > 0.0f) {
+        addPixel(eye.cx + dx, eye.cy + dy, color, cov);
       }
     }
   }
 
-  // Pupil: a soft dark spot that fades at its edge, offset by the look
-  // direction and scaled with the eye. Only when the eye is open enough.
+  // Pupil: a crisp dark disc carved into the iris, offset by the gaze
+  // plus the continuous floaty drift and scaled with the eye. Only shown
+  // when the eye is sufficiently open.
   if (lid > 0.4f) {
-    float pcx = pupilX * scale;   // pupil center relative to eye center
-    float pcy = pupilY * scale;
-    float pr  = (scale > 1.05f) ? 1.4f : 1.0f;  // pupil radius in pixels
+    // Gaze + floaty drift, both in eye-local pixels, scaled with the eye.
+    float pcx = (pupilX + driftX) * scale;
+    float pcy = (pupilY + driftY) * scale;
+    float pr  = PUPIL_RADIUS * scale;    // grows/shrinks with the eye
+    if (pr < 0.4f) pr = 0.4f;
+
+    // Clamp the pupil so it stays visually inside the iris as it roams.
+    float limX = (rx - pr) * 0.9f;
+    float limY = (openRy - pr) * 0.9f;
+    if (limX < 0) limX = 0;
+    if (limY < 0) limY = 0;
+    pcx = constrain(pcx, -limX, limX);
+    pcy = constrain(pcy, -limY, limY);
 
     int pspan = (int)ceilf(pr + 1.0f);
     int basex = (int)roundf(pcx);
     int basey = (int)roundf(pcy);
     for (int dy = -pspan; dy <= pspan; dy++) {
       for (int dx = -pspan; dx <= pspan; dx++) {
-        // Pixel offset from the eye center.
-        int ox = basex + dx;
+        int ox = basex + dx;        // offset from eye center
         int oy = basey + dy;
         float ddx = ox - pcx;
         float ddy = oy - pcy;
         float d = sqrtf(ddx * ddx + ddy * ddy);
-        float dark;
-        if (d <= pr - 0.5f)      dark = 1.0f;
-        else if (d >= pr + 0.5f) dark = 0.0f;
-        else                     dark = 1.0f - (d - (pr - 0.5f));
-        if (dark > 0.0f) {
-          darkenPixel(eye.cx + ox, eye.cy + oy, dark);
-        }
+
+        // Coverage: hard edge by default, optional 1px antialias band.
+        float cov;
+#if PUPIL_SOFT_EDGE
+        if (d <= pr - 0.5f)      cov = 1.0f;
+        else if (d >= pr + 0.5f) cov = 0.0f;
+        else                     cov = 1.0f - (d - (pr - 0.5f));
+#else
+        cov = (d <= pr) ? 1.0f : 0.0f;   // crisp disc
+#endif
+        if (cov <= 0.0f) continue;
+
+        int sx = eye.cx + ox;
+        int sy = eye.cy + oy;
+
+        // Fully carve the iris color out under the pupil so it reads as a
+        // true dark hole. Then add the pupil color on top: for a black
+        // pupil this contributes nothing (the hole stays dark); for a
+        // bright pupil color it fills the carved area as a highlight.
+        darkenPixel(sx, sy, cov);
+        addPixel(sx, sy, PUPIL_COLOR, cov);
       }
     }
   }
@@ -338,13 +382,15 @@ void pickNewAction() {
   int roll = random(100);
   unsigned long now = millis();
 
-  if (roll < 35) {
-    // Saccade: dart the gaze to a new point, then hold.
-    pupilTargetX = frand(-2.5f, 2.5f);
-    pupilTargetY = frand(-1.5f, 1.5f);
+  if (roll < 45) {
+    // Saccade: dart the gaze to a new point. Kept modest so it layers as
+    // an accent on top of the continuous floaty drift rather than
+    // fighting it. Held briefly so the eyes rarely sit still.
+    pupilTargetX = frand(-1.6f, 1.6f);
+    pupilTargetY = frand(-1.0f, 1.0f);
     state = LOOKING;
-    stateUntil = now + random(500, 1800);
-  } else if (roll < 60) {
+    stateUntil = now + random(300, 900);
+  } else if (roll < 62) {
     // Change size: squint, normal, or bulge. Sometimes both eyes match,
     // sometimes they differ for that off-kilter Caine look.
     if (random(100) < 70) {
@@ -356,26 +402,40 @@ void pickNewAction() {
     }
     state = RESIZING;
     stateUntil = now + random(500, 1400);
-  } else if (roll < 82) {
+  } else if (roll < 84) {
     // Blink both eyes.
     state = BLINKING;
     stateUntil = now + 180;
-  } else if (roll < 92) {
+  } else if (roll < 94) {
     // Wink one eye.
     state = WINKING;
     stateUntil = now + 220;
   } else {
-    // Recenter gaze and return to a neutral size.
+    // Brief rest. Gaze eases back toward center, but the floaty drift
+    // keeps the eyes moving, so they never fully freeze.
     pupilTargetX = pupilTargetY = 0.0f;
     scaleTargetLeft = scaleTargetRight = 1.0f;
     state = IDLE;
-    stateUntil = now + random(400, 1200);
+    stateUntil = now + random(250, 700);
   }
   nextAction = stateUntil;
 }
 
 void updateAnimation() {
   unsigned long now = millis();
+
+  // Continuous floaty roll: two slow sine waves per axis at mismatched
+  // frequencies trace a wandering, non-repeating orbit so the eyes keep
+  // moving almost all the time. FLOATINESS scales both the orbit size
+  // and the speed. The horizontal orbit is wider than the vertical since
+  // the eye is wider than it is tall.
+  float t = now / 1000.0f;
+  float spd = 0.6f + FLOATINESS * 1.4f;   // radians/sec base rate
+  driftX = FLOATINESS * 2.2f *
+           (0.6f * sinf(t * spd) + 0.4f * sinf(t * spd * 1.7f + 1.3f));
+  driftY = FLOATINESS * 1.3f *
+           (0.6f * sinf(t * spd * 0.8f + 2.1f) +
+            0.4f * sinf(t * spd * 1.3f));
 
   // Pupils and sizes always ease toward their targets for smooth motion.
   pupilX = approach(pupilX, pupilTargetX, 0.35f);
