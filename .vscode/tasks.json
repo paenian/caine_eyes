@@ -1,0 +1,65 @@
+{
+  // PlatformIO tasks for the Wemos D1 mini (Caine eyes).
+  // Run via: Terminal > Run Task..., or the Command Palette > "Run Task".
+  // "PlatformIO: Upload" is the default build task (bound to the build shortcut).
+  //
+  // PIO_BIN points at the isolated PlatformIO Core install. If you later add
+  // ~/.platformio/penv/bin to PATH everywhere, you can shorten the commands
+  // to just "pio".
+  "version": "2.0.0",
+  "options": {
+    "env": {
+      "PIO_BIN": "${env:HOME}/.platformio/penv/bin/pio",
+      "UPLOAD_PORT": "/dev/cu.usbserial-10"
+    }
+  },
+  "presentation": {
+    "panel": "dedicated",
+    "clear": true
+  },
+  "tasks": [
+    {
+      "label": "PlatformIO: Build",
+      "type": "shell",
+      "command": "$PIO_BIN run",
+      "problemMatcher": "$gcc",
+      "group": "build"
+    },
+    {
+      "label": "PlatformIO: Upload",
+      "type": "shell",
+      "command": "$PIO_BIN run --target upload --upload-port $UPLOAD_PORT",
+      "problemMatcher": "$gcc",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "PlatformIO: Monitor",
+      "type": "shell",
+      "command": "$PIO_BIN device monitor --port $UPLOAD_PORT",
+      "problemMatcher": [],
+      "isBackground": true
+    },
+    {
+      "label": "PlatformIO: Upload + Monitor",
+      "type": "shell",
+      "command": "$PIO_BIN run --target upload --target monitor --upload-port $UPLOAD_PORT --monitor-port $UPLOAD_PORT",
+      "problemMatcher": "$gcc",
+      "isBackground": true
+    },
+    {
+      "label": "PlatformIO: Clean",
+      "type": "shell",
+      "command": "$PIO_BIN run --target clean",
+      "problemMatcher": []
+    },
+    {
+      "label": "PlatformIO: List Devices",
+      "type": "shell",
+      "command": "$PIO_BIN device list",
+      "problemMatcher": []
+    }
+  ]
+}
