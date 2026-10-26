@@ -23,7 +23,7 @@
 // ======================= CONFIG =======================
 
 // Matrix dimensions (in pixels).
-#define MATRIX_WIDTH   32
+#define MATRIX_WIDTH   34
 #define MATRIX_HEIGHT  8
 #define NUM_LEDS       (MATRIX_WIDTH * MATRIX_HEIGHT)
 
@@ -45,7 +45,7 @@
 #define FLIP_VERTICAL  false
 
 // Global brightness 0–255. Keep modest unless you have a beefy 5V supply.
-#define BRIGHTNESS     30
+#define BRIGHTNESS     32
 
 // Caine's eyes: left iris green, right iris blue.
 #define LEFT_EYE_COLOR   CRGB(0,   255, 60)    // left eye (green)
@@ -58,13 +58,13 @@
 
 // Pupil radius in pixels (at normal eye size). Kept small so a ring of
 // iris color always frames it.
-#define PUPIL_RADIUS     0.8f
+#define PUPIL_RADIUS     1.0f
 
 // Color bleed / fade: width in pixels of the OUTWARD glow halo only. The
 // eye interior stays solid/crisp; this only softens the outside edge and
 // spills color into surrounding pixels. 0 = hard outer edge (no bleed);
 // larger = softer, dreamier. ~1.5-2.5 looks good on 8px.
-#define BLEED_WIDTH      1.6f
+#define BLEED_WIDTH      1.9f
 
 // Pupil edge: 1 = antialiased (soft) pupil edge, 0 = hard crisp edge.
 #define PUPIL_SOFT_EDGE  0
@@ -74,16 +74,21 @@
 // Controls both the orbit radius and the drift speed.
 #define FLOATINESS       0.8f
 
+// Average seconds between blinks. Higher = rarer blinks. The actual gap
+// is randomized around this value (roughly 0.6x to 1.4x) so it looks
+// natural. Blinks are timed independently of the other behaviors.
+#define BLINK_INTERVAL_SEC   7.0f
+
 // Eye size scaling. The eye radius is multiplied by a scale that the
 // animation drives between SCALE_MIN and SCALE_MAX.
-#define SCALE_MIN      0.70f
-#define SCALE_MAX      1.30f
+#define SCALE_MIN      0.80f
+#define SCALE_MAX      0.90f
 
 // Idle "breathing": a slow, continuous size pulse so the eyes feel alive
 // even when resting. BREATH_AMP is added to/subtracted from the scale;
 // BREATH_PERIOD_MS is one full inhale+exhale cycle.
 #define BREATH_AMP        0.12f
-#define BREATH_PERIOD_MS  1600.0f
+#define BREATH_PERIOD_MS  3200.0f
 
 // ======================================================
 
@@ -206,8 +211,8 @@ void runTestPattern() {
 // pupil (1–2 px) rides inside it, offset by the shared look direction.
 
 struct Eye {
-  int   cx;       // eye center x on the full canvas
-  int   cy;       // eye center y
+  float cx;       // eye center x on the full canvas (may be fractional)
+  float cy;       // eye center y (may be fractional)
   float baseRx;   // base horizontal radius (before scale)
   float baseRy;   // base vertical radius (before scale)
 };
@@ -230,12 +235,17 @@ float scaleTargetLeft = 1.0f, scaleTargetRight = 1.0f;
 Eye leftEye, rightEye;
 
 void setupEyes() {
-  int quarter = MATRIX_WIDTH / 4;
-  int cy = (MATRIX_HEIGHT - 1) / 2;
+  // True geometric center of the panel. For an even height (e.g. 8 rows,
+  // 0..7) this is a half-pixel value (3.5) so the eye spans every row
+  // symmetrically instead of leaving the last row dark.
+  float cx = (MATRIX_WIDTH  - 1) / 2.0f;
+  float cy = (MATRIX_HEIGHT - 1) / 2.0f;
   float ry = (MATRIX_HEIGHT / 2.0f) - 0.5f;   // vertical radius fills height
   float rx = ry + 1.0f;                        // slightly wider than tall
-  leftEye  = { quarter,                    cy, rx, ry };
-  rightEye = { MATRIX_WIDTH - 1 - quarter, cy, rx, ry };
+
+  float quarter = MATRIX_WIDTH / 4.0f;
+  leftEye  = { quarter,                          cy, rx, ry };
+  rightEye = { (MATRIX_WIDTH - 1) - quarter,     cy, rx, ry };
 }
 
 // Draw one eye as a soft-edged ellipse that bleeds its color into the
@@ -263,13 +273,20 @@ void drawEye(const Eye& eye, float lid, float scale, const CRGB& color) {
   float feather  = (featherX + featherY) * 0.5f;
   if (feather < 0.0001f) feather = 0.0001f;  // avoid divide-by-zero
 
-  int spanX = (int)ceilf(rx + BLEED_WIDTH);
-  int spanY = (int)ceilf(ry + BLEED_WIDTH);
+  // Iterate the integer pixels around the (possibly fractional) center.
+  int ccx = (int)roundf(eye.cx);
+  int ccy = (int)roundf(eye.cy);
+  int spanX = (int)ceilf(rx + BLEED_WIDTH) + 1;
+  int spanY = (int)ceilf(ry + BLEED_WIDTH) + 1;
 
-  for (int dy = -spanY; dy <= spanY; dy++) {
-    for (int dx = -spanX; dx <= spanX; dx++) {
-      float nx = dx / rx;
-      float ny = dy / ry;
+  for (int py = ccy - spanY; py <= ccy + spanY; py++) {
+    for (int px = ccx - spanX; px <= ccx + spanX; px++) {
+      // Offset of this pixel from the true (fractional) eye center.
+      float ddx = px - eye.cx;
+      float ddy = py - eye.cy;
+
+      float nx = ddx / rx;
+      float ny = ddy / ry;
       float r = sqrtf(nx * nx + ny * ny);
 
       // Radial coverage: 1 inside, ramping to 0 across the feather band.
@@ -283,12 +300,9 @@ void drawEye(const Eye& eye, float lid, float scale, const CRGB& color) {
       // Eyelid clip: hard vertical cut so the eye interior stays solid
       // (the bleed is an OUTWARD glow only, not an inward fade). During a
       // blink the whole eye shrinks vertically via openRy.
-      float ay = fabs((float)dy);
-      if (ay > openRy) continue;
+      if (fabs(ddy) > openRy) continue;
 
-      if (cov > 0.0f) {
-        addPixel(eye.cx + dx, eye.cy + dy, color, cov);
-      }
+      addPixel(px, py, color, cov);
     }
   }
 
@@ -310,15 +324,16 @@ void drawEye(const Eye& eye, float lid, float scale, const CRGB& color) {
     pcx = constrain(pcx, -limX, limX);
     pcy = constrain(pcy, -limY, limY);
 
+    // Absolute (fractional) pupil center on the canvas.
+    float cxAbs = eye.cx + pcx;
+    float cyAbs = eye.cy + pcy;
     int pspan = (int)ceilf(pr + 1.0f);
-    int basex = (int)roundf(pcx);
-    int basey = (int)roundf(pcy);
-    for (int dy = -pspan; dy <= pspan; dy++) {
-      for (int dx = -pspan; dx <= pspan; dx++) {
-        int ox = basex + dx;        // offset from eye center
-        int oy = basey + dy;
-        float ddx = ox - pcx;
-        float ddy = oy - pcy;
+    int baseX = (int)roundf(cxAbs);
+    int baseY = (int)roundf(cyAbs);
+    for (int py = baseY - pspan; py <= baseY + pspan; py++) {
+      for (int px = baseX - pspan; px <= baseX + pspan; px++) {
+        float ddx = px - cxAbs;
+        float ddy = py - cyAbs;
         float d = sqrtf(ddx * ddx + ddy * ddy);
 
         // Coverage: hard edge by default, optional 1px antialias band.
@@ -332,8 +347,8 @@ void drawEye(const Eye& eye, float lid, float scale, const CRGB& color) {
 #endif
         if (cov <= 0.0f) continue;
 
-        int sx = eye.cx + ox;
-        int sy = eye.cy + oy;
+        int sx = px;
+        int sy = py;
 
         // Fully carve the iris color out under the pupil so it reads as a
         // true dark hole. Then add the pupil color on top: for a black
@@ -367,6 +382,7 @@ EyeState state = IDLE;
 
 unsigned long stateUntil = 0;
 unsigned long nextAction = 0;
+unsigned long nextBlink  = 0;    // when the next blink should start
 bool winkLeft = true;
 
 float approach(float current, float target, float rate) {
@@ -378,11 +394,21 @@ float frand(float lo, float hi) {
   return lo + (hi - lo) * (random(1001) / 1000.0f);
 }
 
+// Schedule the next blink around BLINK_INTERVAL_SEC, randomized 0.6x-1.4x
+// so the rhythm looks natural rather than metronomic.
+void scheduleNextBlink() {
+  float jitter = frand(0.6f, 1.4f);
+  nextBlink = millis() + (unsigned long)(BLINK_INTERVAL_SEC * 1000.0f * jitter);
+}
+
 void pickNewAction() {
   int roll = random(100);
   unsigned long now = millis();
 
-  if (roll < 45) {
+  // Blinks are handled separately on their own timer (see the blink
+  // scheduler in updateAnimation), so this roll only covers the ambient
+  // look-around, resize, wink, and rest behaviors.
+  if (roll < 55) {
     // Saccade: dart the gaze to a new point. Kept modest so it layers as
     // an accent on top of the continuous floaty drift rather than
     // fighting it. Held briefly so the eyes rarely sit still.
@@ -390,7 +416,7 @@ void pickNewAction() {
     pupilTargetY = frand(-1.0f, 1.0f);
     state = LOOKING;
     stateUntil = now + random(300, 900);
-  } else if (roll < 62) {
+  } else if (roll < 82) {
     // Change size: squint, normal, or bulge. Sometimes both eyes match,
     // sometimes they differ for that off-kilter Caine look.
     if (random(100) < 70) {
@@ -402,11 +428,7 @@ void pickNewAction() {
     }
     state = RESIZING;
     stateUntil = now + random(500, 1400);
-  } else if (roll < 84) {
-    // Blink both eyes.
-    state = BLINKING;
-    stateUntil = now + 180;
-  } else if (roll < 94) {
+  } else if (roll < 90) {
     // Wink one eye.
     state = WINKING;
     stateUntil = now + 220;
@@ -468,6 +490,16 @@ void updateAnimation() {
       break;
   }
 
+  // Dedicated blink timer: fires independently of the random behaviors so
+  // blink frequency is controlled solely by BLINK_INTERVAL_SEC. Only
+  // start a blink if we're not mid-blink/wink, to avoid stacking them.
+  if (now >= nextBlink && state != BLINKING && state != WINKING) {
+    state = BLINKING;
+    stateUntil = now + 180;
+    nextAction = stateUntil;   // resume normal behavior after the blink
+    scheduleNextBlink();
+  }
+
   if (now >= nextAction) {
     if (state == WINKING) winkLeft = !winkLeft;  // alternate wink eye
     pickNewAction();
@@ -489,6 +521,7 @@ void setup() {
 
   setupEyes();
   pickNewAction();
+  scheduleNextBlink();
 }
 
 void loop() {
